@@ -1,0 +1,97 @@
+import hmac
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from app.api.router import api_router
+from app.api.routes import health
+from app.core import config
+from app.core.db import SessionLocal
+from app.services.auth_security import hash_session_value, load_active_session, valid_csrf_token
+
+
+def create_app(demo_enabled: bool | None = None, demo_token: str | None = None) -> FastAPI:
+    enabled = config.DEMO_ADMIN_ENABLED if demo_enabled is None else demo_enabled
+    token = config.DEMO_ADMIN_TOKEN if demo_token is None else demo_token
+    from app.core.config import valid_demo_admin_token
+
+    application = FastAPI(title="BriefForge API")
+    application.state.demo_admin_token = token
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @application.middleware("http")
+    async def demo_security_headers(request, call_next):
+        result = await call_next(request)
+        if request.url.path.startswith(("/auth/", "/api/v1/auth/", "/api/v1/profile", "/api/v1/users/me/avatar")):
+            result.headers["Cache-Control"] = "private, no-store" if request.url.path == "/api/v1/users/me/avatar" else "no-store"
+            result.headers["X-Content-Type-Options"] = "nosniff"
+        if request.url.path == "/admin/demo" or request.url.path.startswith("/admin/demo/"):
+            result.headers["Cache-Control"] = "no-store"
+            result.headers["X-Content-Type-Options"] = "nosniff"
+            result.headers["X-Frame-Options"] = "DENY"
+        return result
+
+    @application.middleware("http")
+    async def csrf_protection(request: Request, call_next):
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            raw_session = request.cookies.get(config.SESSION_COOKIE_NAME)
+            if raw_session and not request.url.path.startswith("/admin/demo"):
+                async with SessionLocal() as db:
+                    active = await load_active_session(db, raw_session)
+                    if active is not None:
+                        session, _user = active
+                        csrf_cookie = request.cookies.get(config.CSRF_COOKIE_NAME, "")
+                        csrf_header = request.headers.get("X-CSRF-Token", "")
+                        if (
+                            not valid_csrf_token(csrf_cookie)
+                            or not valid_csrf_token(csrf_header)
+                            or not hmac.compare_digest(csrf_cookie, csrf_header)
+                            or not hmac.compare_digest(hash_session_value(csrf_header), session.csrf_token_hash)
+                        ):
+                            return JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
+        return await call_next(request)
+
+    @application.exception_handler(RequestValidationError)
+    async def safe_validation_errors(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith(("/auth/", "/api/v1/auth/", "/api/v1/profile", "/api/v1/admin/")):
+            errors = [
+                {key: value for key, value in error.items() if key not in {"input", "ctx", "url"}}
+                for error in exc.errors()
+            ]
+            return JSONResponse(status_code=422, content={"detail": errors})
+        return await request_validation_exception_handler(request, exc)
+
+    @application.middleware("http")
+    async def admin_security_headers(request: Request, call_next):
+        is_admin_api = request.url.path == "/api/v1/admin" or request.url.path.startswith("/api/v1/admin/")
+        try:
+            result = await call_next(request)
+        except Exception:
+            if not is_admin_api:
+                raise
+            logging.getLogger(__name__).exception("Admin API request failed")
+            result = JSONResponse(status_code=500, content={"detail": "Unable to complete admin request"})
+        if is_admin_api:
+            result.headers["Cache-Control"] = "private, no-store"
+            result.headers["X-Content-Type-Options"] = "nosniff"
+        return result
+
+    application.include_router(health.router)
+    application.include_router(api_router)
+    if enabled and valid_demo_admin_token(token):
+        from app.api.routes.demo_admin import router
+        application.include_router(router)
+    return application
+
+
+app = create_app()

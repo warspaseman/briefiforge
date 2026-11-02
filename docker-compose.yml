@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-briefforge}
+      POSTGRES_USER: ${POSTGRES_USER:-briefforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-briefforge_local_dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-briefforge}:${POSTGRES_PASSWORD:-briefforge_local_dev}@postgres:5432/${POSTGRES_DB:-briefforge}}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+        restart: true
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-briefforge}:${POSTGRES_PASSWORD:-briefforge_local_dev}@postgres:5432/${POSTGRES_DB:-briefforge}}
+      ML_SERVICE_URL: http://ml:8001
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-briefforge_session}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-604800}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      AVATAR_DIRECTORY: /app/media/avatars
+    volumes:
+      - media-data:/app/media
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  ml:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    expose:
+      - "8001"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  media-data:
